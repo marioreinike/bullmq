@@ -356,7 +356,20 @@ export class RedisConnection extends EventEmitter {
         let outcome = 'success';
         let caught;
         try {
-            client.disconnect(false);
+            // `disconnect(true)` is ioredis's "I'm about to reconnect" signal — it
+            // drains the connection pool without setting `manuallyClosing=true`.
+            // The `false` variant (used by the original 5.76.6 patch) flips
+            // `manuallyClosing` to true, which poisons `handleCloseEvent` into the
+            // terminal `status="end"` branch when our subsequent `connect()`
+            // rejects. Once the cluster lands in `"end"`, ioredis will not revive
+            // it on its own (no `clusterRetryStrategy` runs from there) and our
+            // worker's bzpopmin loop never recovers — `isReconnectingDisabled`
+            // correctly treats `"end"` as terminal (genuine shutdown and
+            // user-configured `clusterRetryStrategy` give-up both legitimately
+            // land there). Using `disconnect(true)` keeps `manuallyClosing`
+            // unchanged so a failed reconnect transitions through `"reconnecting"`
+            // instead, leaving both ioredis and this worker able to retry.
+            client.disconnect(true);
             // Let the disconnect's asynchronous teardown chain settle before
             // connect() registers its listeners. See DISCONNECT_SETTLE_MS comment
             // for the failure mode this prevents.
