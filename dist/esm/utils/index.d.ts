@@ -35,8 +35,8 @@ export declare const optsDecodeMap: {
 };
 export declare const optsEncodeMap: {
     readonly debounce: "de";
-    readonly deduplication: "de";
     readonly keepLogs: "kl";
+    readonly deduplication: "de";
     readonly failParentOnFailure: "fpof";
     readonly continueParentOnFailure: "cpof";
     readonly ignoreDependencyOnFailure: "idof";

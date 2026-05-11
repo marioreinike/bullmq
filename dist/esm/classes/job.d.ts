@@ -200,7 +200,7 @@ export declare class Job<DataType = any, ReturnType = any, NameType extends stri
      * @returns The total number of log entries for this job so far.
      */
     static addJobLog(queue: MinimalQueue, jobId: string, logRow: string, keepLogs?: number): Promise<number>;
-    toJSON(): Omit<this, "queue" | "scripts" | "toJSON" | "asJSON" | "asJSONSandbox" | "updateData" | "updateProgress" | "log" | "removeChildDependency" | "clearLogs" | "remove" | "removeUnprocessedChildren" | "extendLock" | "moveToCompleted" | "moveToWait" | "moveToFailed" | "isCompleted" | "isFailed" | "isDelayed" | "isWaitingChildren" | "isActive" | "isWaiting" | "queueName" | "prefix" | "getState" | "changeDelay" | "changePriority" | "getChildrenValues" | "getIgnoredChildrenFailures" | "getFailedChildrenValues" | "getDependencies" | "getDependenciesCount" | "waitUntilFinished" | "moveToDelayed" | "moveToWaitingChildren" | "promote" | "retry" | "discard" | "addJob" | "removeDeduplicationKey">;
+    toJSON(): Omit<this, "queueName" | "prefix" | "moveToWaitingChildren" | "getChildrenValues" | "getIgnoredChildrenFailures" | "getDependenciesCount" | "getDependencies" | "discard" | "queue" | "scripts" | "toJSON" | "asJSON" | "asJSONSandbox" | "updateData" | "updateProgress" | "log" | "removeChildDependency" | "clearLogs" | "remove" | "removeUnprocessedChildren" | "extendLock" | "moveToCompleted" | "moveToWait" | "moveToFailed" | "isCompleted" | "isFailed" | "isDelayed" | "isWaitingChildren" | "isActive" | "isWaiting" | "getState" | "changeDelay" | "changePriority" | "getFailedChildrenValues" | "waitUntilFinished" | "moveToDelayed" | "promote" | "retry" | "addJob" | "removeDeduplicationKey">;
     /**
      * Prepares a job to be serialized for storage in Redis.
      * @returns

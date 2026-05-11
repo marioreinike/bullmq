@@ -5,6 +5,12 @@ interface RedisCapabilities {
     canDoubleTimeout: boolean;
     canBlockFor1Ms: boolean;
 }
+export interface ClusterReconnectEvent {
+    outcome: 'success' | 'timeout' | 'error';
+    attempt: number;
+    durationMs: number;
+    error?: string;
+}
 export interface RawCommand {
     content: string;
     name: string;
