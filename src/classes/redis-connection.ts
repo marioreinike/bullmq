@@ -30,6 +30,7 @@ const clusterOriginalBzpopmin = Symbol('bullmqClusterOriginalBzpopmin');
 const clusterWrappedBzpopmin = Symbol('bullmqClusterWrappedBzpopmin');
 const clusterPatchRefCount = Symbol('bullmqClusterPatchRefCount');
 const clusterClosingRefCount = Symbol('bullmqClusterClosingRefCount');
+const clusterReconnectAttempt = Symbol('bullmqClusterReconnectAttempt');
 
 // Hard cap on a single cluster reconnect attempt. Without this, a hung
 // `client.connect()` (e.g. ioredis Cluster cannot recover and slot refresh
@@ -38,6 +39,19 @@ const clusterClosingRefCount = Symbol('bullmqClusterClosingRefCount');
 // the worker. 30s is comfortably above the default ioredis slotsRefreshTimeout
 // while bounded enough that wedged workers recover within one or two ticks.
 const DEFAULT_CLUSTER_RECONNECT_TIMEOUT_MS = 30_000;
+
+// Async gap between `disconnect(false)` and `connect()`. `disconnect(false)`
+// triggers an asynchronous teardown chain inside ioredis Cluster: each pool
+// node's TCP socket closes, the ConnectionPool emits "drain" once `nodes.all`
+// is empty, and the Cluster reacts by emitting a "close" event. If
+// `connect()` runs synchronously after `disconnect(false)`, it registers its
+// own "close" listener while that teardown is still in flight — the listener
+// then catches the stale close event from our own disconnect and rejects
+// with `"None of startup nodes is available"`, so every reconnect attempt
+// fails with the same error and the worker never recovers. Letting the
+// event loop turn for ~200ms is empirically enough for the teardown chain
+// to settle before the new connect listeners are wired up.
+const DISCONNECT_SETTLE_MS = 200;
 
 interface RedisCapabilities {
   canDoubleTimeout: boolean;
@@ -51,11 +65,20 @@ interface BlockingClusterClient {
   [clusterWrappedBzpopmin]?: BlockingClusterClient['bzpopmin'];
   [clusterPatchRefCount]?: number;
   [clusterClosingRefCount]?: number;
+  [clusterReconnectAttempt]?: number;
   bzpopmin: (...args: any[]) => Promise<unknown>;
   connect: () => Promise<void>;
   disconnect: (reconnect?: boolean) => void;
+  emit?: (event: string, payload: unknown) => boolean;
   nodes?: () => unknown[];
   status?: string;
+}
+
+export interface ClusterReconnectEvent {
+  outcome: 'success' | 'timeout' | 'error';
+  attempt: number;
+  durationMs: number;
+  error?: string;
 }
 
 export interface RawCommand {
@@ -531,31 +554,73 @@ export class RedisConnection extends EventEmitter {
   // (ioredis Cluster handles its own retry/state); we simply stop awaiting it.
   // The next bzpopmin call's `reconnectClusterIfNeeded` check will trigger a
   // fresh reconnect if the pool is still empty.
+  //
+  // A `bullmq:cluster-reconnect` event is emitted on the underlying ioredis
+  // Cluster client with `{ outcome, attempt, durationMs, error? }` so that
+  // subscribers (observability layers that already hold a reference to the
+  // blocking client) can record reconnect telemetry without bullmq plumbing
+  // a tracer through static methods.
   private static async connectClusterWithTimeout(
     client: BlockingClusterClient,
     timeoutMs: number,
   ): Promise<void> {
-    client.disconnect(false);
+    const attempt = (client[clusterReconnectAttempt] ?? 0) + 1;
+    client[clusterReconnectAttempt] = attempt;
+    const startedAt = Date.now();
+    let outcome: ClusterReconnectEvent['outcome'] = 'success';
+    let caught: Error | undefined;
 
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
-        client.connect(),
-        new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            reject(
-              new Error(
-                `BullMQ: cluster reconnect timed out after ${timeoutMs}ms`,
-              ),
-            );
-          }, timeoutMs);
-          // Don't keep the event loop alive solely for this timer.
-          timeoutHandle.unref?.();
-        }),
-      ]);
+      client.disconnect(false);
+
+      // Let the disconnect's asynchronous teardown chain settle before
+      // connect() registers its listeners. See DISCONNECT_SETTLE_MS comment
+      // for the failure mode this prevents.
+      await new Promise<void>(resolve => {
+        const handle = setTimeout(resolve, DISCONNECT_SETTLE_MS);
+        handle.unref?.();
+      });
+
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          client.connect(),
+          new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(() => {
+              outcome = 'timeout';
+              reject(
+                new Error(
+                  `BullMQ: cluster reconnect timed out after ${timeoutMs}ms`,
+                ),
+              );
+            }, timeoutMs);
+            // Don't keep the event loop alive solely for this timer.
+            timeoutHandle.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+      }
+    } catch (err) {
+      caught = err as Error;
+      if (outcome === 'success') {
+        outcome = 'error';
+      }
+      throw caught;
     } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
+      const event: ClusterReconnectEvent = {
+        outcome,
+        attempt,
+        durationMs: Date.now() - startedAt,
+        ...(caught ? { error: caught.message } : {}),
+      };
+      // A subscriber throwing here must not break the reconnect contract.
+      try {
+        client.emit?.('bullmq:cluster-reconnect', event);
+      } catch {
+        // ignore listener errors
       }
     }
   }

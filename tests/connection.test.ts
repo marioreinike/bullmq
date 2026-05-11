@@ -30,6 +30,7 @@ describe('RedisConnection', () => {
       on: sinon.stub(),
       once: sinon.stub(),
       off: sinon.stub(),
+      emit: sinon.stub().returns(true),
       removeListener: sinon.stub(),
       getMaxListeners: sinon.stub().returns(10),
       setMaxListeners: sinon.stub(),
@@ -369,6 +370,111 @@ describe('RedisConnection', () => {
       // than awaiting the dead promise from the first attempt.
       expect(cluster.disconnect.callCount).toBe(2);
       expect(cluster.connect.callCount).toBe(2);
+
+      await connection.close(true);
+    });
+
+    // Regression for the secondary deadlock observed in production after the
+    // initial timeout fix: connect() rejects fast with "None of startup nodes
+    // is available" because it catches the stale close event from our own
+    // disconnect(false), so the timeout never fires and the worker re-enters
+    // the reconnect loop indefinitely. The fix is to defer connect() until
+    // the disconnect's teardown chain has settled.
+    it('defers connect() until after the disconnect teardown chain settles', async () => {
+      let connectCalledAt: number | null = null;
+      let disconnectCalledAt: number | null = null;
+      const cluster = createMockClusterClient({
+        disconnect: sinon.stub().callsFake(() => {
+          disconnectCalledAt = Date.now();
+        }),
+        connect: sinon.stub().callsFake(async () => {
+          connectCalledAt = Date.now();
+        }),
+        nodes: sinon.stub().returns([]),
+        bzpopmin: sinon.stub().resolves(['marker', '0', '1']),
+      });
+      const connection = new RedisConnection(cluster as any, {
+        blocking: true,
+        skipVersionCheck: true,
+        skipWaitingForReady: true,
+      });
+
+      const client = await connection.client;
+      await (client as any).bzpopmin('marker', 1);
+
+      expect(disconnectCalledAt).not.toBeNull();
+      expect(connectCalledAt).not.toBeNull();
+      // We deliberately leave a gap (~200ms) between disconnect and connect
+      // so ioredis can finish emitting its own "close" event before connect()
+      // wires up listeners.
+      expect(connectCalledAt! - disconnectCalledAt!).toBeGreaterThanOrEqual(
+        150,
+      );
+
+      await connection.close(true);
+    });
+
+    it('emits bullmq:cluster-reconnect with outcome=success on successful reconnect', async () => {
+      let hasNodes = false;
+      const cluster = createMockClusterClient({
+        connect: sinon.stub().callsFake(async () => {
+          hasNodes = true;
+        }),
+        nodes: sinon.stub().callsFake(() => (hasNodes ? [{}] : [])),
+        bzpopmin: sinon.stub().resolves(['marker', '0', '1']),
+      });
+      const connection = new RedisConnection(cluster as any, {
+        blocking: true,
+        skipVersionCheck: true,
+        skipWaitingForReady: true,
+      });
+
+      const client = await connection.client;
+      await (client as any).bzpopmin('marker', 1);
+
+      const reconnectEmit = cluster.emit
+        .getCalls()
+        .find(
+          (call: sinon.SinonSpyCall) =>
+            call.args[0] === 'bullmq:cluster-reconnect',
+        );
+      expect(reconnectEmit).toBeDefined();
+      const payload = reconnectEmit!.args[1];
+      expect(payload).toMatchObject({ outcome: 'success', attempt: 1 });
+      expect(payload.durationMs).toBeGreaterThanOrEqual(0);
+      expect(payload.error).toBeUndefined();
+
+      await connection.close(true);
+    });
+
+    it('emits bullmq:cluster-reconnect with outcome=timeout when reconnect hangs', async () => {
+      const cluster = createMockClusterClient({
+        connect: sinon.stub().returns(new Promise<void>(() => {})),
+        nodes: sinon.stub().returns([]),
+        bzpopmin: sinon.stub().resolves(['marker', '0', '1']),
+      });
+      const connection = new RedisConnection(cluster as any, {
+        blocking: true,
+        skipVersionCheck: true,
+        skipWaitingForReady: true,
+        clusterReconnectTimeoutMs: 50,
+      });
+
+      const client = await connection.client;
+      await expect((client as any).bzpopmin('marker', 1)).rejects.toThrow(
+        /cluster reconnect timed out/i,
+      );
+
+      const reconnectEmit = cluster.emit
+        .getCalls()
+        .find(
+          (call: sinon.SinonSpyCall) =>
+            call.args[0] === 'bullmq:cluster-reconnect',
+        );
+      expect(reconnectEmit).toBeDefined();
+      const payload = reconnectEmit!.args[1];
+      expect(payload).toMatchObject({ outcome: 'timeout', attempt: 1 });
+      expect(payload.error).toMatch(/cluster reconnect timed out/i);
 
       await connection.close(true);
     });
