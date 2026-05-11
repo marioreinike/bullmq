@@ -114,7 +114,7 @@ describe('RedisConnection', () => {
       const client = await connection.client;
       const result = await (client as any).bzpopmin('marker', 1);
 
-      expect(cluster.disconnect.calledOnceWith(false)).toBe(true);
+      expect(cluster.disconnect.calledOnceWith(true)).toBe(true);
       expect(cluster.connect.calledOnce).toBe(true);
       expect(bzpopmin.calledOnceWith('marker', 1)).toBe(true);
       expect(result).toEqual(['marker', '0', '1']);
@@ -221,7 +221,7 @@ describe('RedisConnection', () => {
       await expect((client as any).bzpopmin('marker', 1)).rejects.toThrow(
         'Command timed out',
       );
-      expect(cluster.disconnect.calledOnceWith(false)).toBe(true);
+      expect(cluster.disconnect.calledOnceWith(true)).toBe(true);
       expect(cluster.connect.calledOnce).toBe(true);
       expect(bzpopmin.calledOnceWith('marker', 1)).toBe(true);
 
@@ -248,7 +248,7 @@ describe('RedisConnection', () => {
         'Command timed out',
       );
       expect(cluster.disconnect.calledOnce).toBe(true);
-      expect(cluster.disconnect.calledWith(false)).toBe(false);
+      expect(cluster.disconnect.calledWith(true)).toBe(false);
       expect(cluster.connect.called).toBe(false);
       expect(bzpopmin.calledOnceWith('marker', 1)).toBe(true);
     });
@@ -276,7 +276,7 @@ describe('RedisConnection', () => {
       }
 
       expect(thrownError).toBe(commandError);
-      expect(cluster.disconnect.calledOnceWith(false)).toBe(true);
+      expect(cluster.disconnect.calledOnceWith(true)).toBe(true);
       expect(cluster.connect.calledOnce).toBe(true);
       expect(bzpopmin.calledOnceWith('marker', 1)).toBe(true);
 
@@ -300,7 +300,7 @@ describe('RedisConnection', () => {
       await expect((client as any).bzpopmin('marker', 1)).rejects.toThrow(
         'Failed to refresh slots cache.',
       );
-      expect(cluster.disconnect.calledOnceWith(false)).toBe(true);
+      expect(cluster.disconnect.calledOnceWith(true)).toBe(true);
       expect(cluster.connect.calledOnce).toBe(true);
       expect(bzpopmin.calledOnceWith('marker', 1)).toBe(true);
 
@@ -334,7 +334,7 @@ describe('RedisConnection', () => {
       await expect((client as any).bzpopmin('marker', 1)).rejects.toThrow(
         /cluster reconnect timed out after 50ms/i,
       );
-      expect(cluster.disconnect.calledOnceWith(false)).toBe(true);
+      expect(cluster.disconnect.calledOnceWith(true)).toBe(true);
       expect(cluster.connect.calledOnce).toBe(true);
       // bzpopmin must NOT be invoked when the pre-call reconnect times out;
       // otherwise it would block on the same dead cluster state.
@@ -475,6 +475,63 @@ describe('RedisConnection', () => {
       const payload = reconnectEmit!.args[1];
       expect(payload).toMatchObject({ outcome: 'timeout', attempt: 1 });
       expect(payload.error).toMatch(/cluster reconnect timed out/i);
+
+      await connection.close(true);
+    });
+
+    // Regression for a tertiary deadlock observed in production after the
+    // settle-gap fix: a few reconnects per task still lost the slot-refresh
+    // race and rejected with "None of startup nodes is available". The
+    // original 5.76.6 patch used `client.disconnect(false)`, which sets
+    // `manuallyClosing=true` on the underlying ioredis Cluster. When the
+    // subsequent `connect()` rejects, ioredis's `handleCloseEvent` lands in
+    // the terminal `status="end"` branch (because `manuallyClosing` is
+    // true), and `isReconnectingDisabled` correctly skips future reconnects
+    // for clients in `"end"` (reserved for shutdown and clusterRetryStrategy
+    // give-up). Using `disconnect(true)` instead keeps `manuallyClosing`
+    // unchanged so the cluster transitions through `"reconnecting"` on
+    // failure, leaving the worker and ioredis able to retry.
+    it('uses disconnect(true) so a failed reconnect can be retried instead of latching to status="end"', async () => {
+      const connect = sinon.stub();
+      // First connect rejects (slot refresh race); second connect succeeds.
+      connect
+        .onFirstCall()
+        .rejects(new Error('None of startup nodes is available'));
+      connect.onSecondCall().resolves();
+      const cluster = createMockClusterClient({
+        connect,
+        nodes: sinon.stub().returns([]),
+        bzpopmin: sinon.stub().resolves(['marker', '0', '1']),
+      });
+      const connection = new RedisConnection(cluster as any, {
+        blocking: true,
+        skipVersionCheck: true,
+        skipWaitingForReady: true,
+      });
+
+      const client = await connection.client;
+
+      // First bzpopmin: pre-call reconnect fires, connect() rejects, the
+      // error propagates. The cluster never reached status="end" because
+      // disconnect(true) didn't poison manuallyClosing.
+      await expect((client as any).bzpopmin('marker', 1)).rejects.toThrow(
+        'None of startup nodes is available',
+      );
+
+      // Second bzpopmin: pre-call reconnect fires again (would be skipped
+      // if the patch had used disconnect(false) and we'd latched to "end"),
+      // connect() succeeds.
+      await (client as any).bzpopmin('marker', 1);
+
+      // Every disconnect call from the patch is disconnect(true).
+      const disconnectCalls = cluster.disconnect
+        .getCalls()
+        .filter((call: sinon.SinonSpyCall) => call.args[0] === true);
+      expect(disconnectCalls.length).toBeGreaterThanOrEqual(2);
+      // disconnect(false) MUST NOT be called by the patch — that would
+      // poison ioredis's reconnect intent on the real Cluster.
+      expect(cluster.disconnect.calledWith(false)).toBe(false);
+      expect(connect.callCount).toBe(2);
 
       await connection.close(true);
     });
