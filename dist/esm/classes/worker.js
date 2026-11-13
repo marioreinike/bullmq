@@ -15,6 +15,7 @@ import { JobScheduler } from './job-scheduler';
 import { LockManager } from './lock-manager';
 // 10 seconds is the maximum time a BZPOPMIN can block.
 const maximumBlockTimeout = 10;
+const blockingDisconnectMarginMs = 10000;
 /**
  *
  * This class represents a worker that is able to process jobs from the queue.
@@ -428,7 +429,7 @@ export class Worker extends QueueBase {
                     // don't get a response in the expected time.
                     timeout = setTimeout(async () => {
                         bclient.disconnect(!this.closing);
-                    }, blockTimeout * 1000 + 1000);
+                    }, blockTimeout * 1000 + blockingDisconnectMarginMs);
                     this.updateDelays(); // reset delays to avoid reusing same values in next iteration
                     // Markers should only be used for un-blocking, so we will handle them in this
                     // function only.
