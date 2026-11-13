@@ -44,6 +44,7 @@ import { LockManager } from './lock-manager';
 
 // 10 seconds is the maximum time a BZPOPMIN can block.
 const maximumBlockTimeout = 10;
+const blockingDisconnectMarginMs = 10_000;
 
 // note: sandboxed processors would also like to define concurrency per process
 // for better resource utilization.
@@ -805,7 +806,7 @@ will never work with more accuracy than 1ms. */
             async () => {
               bclient.disconnect(!this.closing);
             },
-            blockTimeout * 1000 + 1000,
+            blockTimeout * 1000 + blockingDisconnectMarginMs,
           );
 
           this.updateDelays(); // reset delays to avoid reusing same values in next iteration
